@@ -1,0 +1,260 @@
+#!/bin/sh
+# Description: A utility script that builds an archive file(s) of all
+#              git repositories and submodules in the current path.
+#              Useful for creating a single tarfile of a git super-
+#              project that contains other submodules.
+#
+# Examples:    Use git archive-all to create archive distributions from git
+#              repositories. To use, simply do:
+#
+#                  cd $GIT_DIR; git archive-all
+#
+#              where $GIT_DIR is the root of your git superproject.
+#
+# License:     GPL3
+# Copyright:   2008, 2009, 2010, 2012
+#              The owner of https://github.com/meitar/git-archive-all.sh
+###############################################################################
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301  USA
+###############################################################################
+set -e
+set -u
+set -C # noclobber
+prog="$(basename -- "$0")"
+nogitprog="${prog#git-}"
+niceprog="$prog"
+if test "$prog" != "$nogitprog" ; then niceprog="git $nogitprog" ; fi
+VERSION=1.0
+version() { echo "$prog version $VERSION" ; }
+IFS=' 	
+'
+E_USAGE=254
+E_BAD_REPO=253
+E_BAD_WRITE=252
+SEPARATE=0
+VERBOSITY=0
+VPREFIX="verbose: "
+DEBUG=0
+NO_CLEANUP=0
+FORMAT=tar
+PREFIX=
+GETSHA1=sha1
+TMPDIR="${TMPDIR:-/tmp}"
+WORKDIR=
+go=
+redir() { local f="$1" ; shift ; "$@" > "$f" ; }
+credir() { local f="$1" ; shift ; "$@" >| "$f" ; }
+ignore() { true ; }
+quotecmd() {
+    bash -c 'sep= ; for i in "$@" ; do
+        case "$i" in
+            \>?|\<?|\>|\<) fmt=s ;;
+            *) fmt=q ;;
+        esac
+        printf "%s%${fmt}" "$sep" "$i" ; sep=" "
+    done ; echo' bash "$@"
+}
+verbose() {
+    local v="$1" ; shift
+    if test "${VERBOSITY:-0}" -ge "$v" ; then
+        printf "%s" "$VPREFIX" ; quotecmd "$@"
+    fi
+}
+cleanup() {
+    if test $# -eq 0 && test -n "${WORKDIR:-}" ; then set -- -r "$WORKDIR" ; fi
+    if test "${NO_CLEANUP:-0}" -eq 0 ; then
+        verbose 3 rm -f "$@"
+        rm -f "$@"
+    fi
+}
+trap 'cleanup' 0
+trap ' echo Caught SIGINT >&2 ; exit 1 ; ' INT
+trap ' echo Caught SIGTERM >&2 ; exit 1 ; ' TERM
+usage() {
+    cat <<EOF
+Creates an aggregated archive for the entire git superproject, and its submodules.
+The names of submodule archives will have all path separators replaced with '.'
+usage: $niceprog [options] [--] [<output>]
+  --format <fmt>, --format=<fmt>
+                    archive format for git to use (and for $niceprog to aggregate)
+  --prefix <path>, --prefix=<path>
+                    if given, contents of the archive will be prefixed with <path>,
+                    so end <path> with a / to place the contents in a directory
+  -s, --separate    if given, each submodule gets its own archive
+  --head            get the submodule revision via \`git rev-parse HEAD\` instead of \$sha1
+  --temp-dir <tmpdir>, --tmp-dir <tmpdir>, --temp-dir=<tmpdir>, --tmp-dir=<tmpdir>
+                    use the given temporary directory (if you can't do \`mktemp -d\`)
+  -f, --force       allow overwriting existing files (without warning)
+  -v, --verbose, --verbose=<level>
+                    print some more of the commands before they are run
+  -q, --quiet       analagous to --verbose=0
+  -n, --dry-run     don't actually run any git archive or <fmt> commands
+  -d, --debug       call \`set -x\` just before starting to do the archive work
+  --no-cleanup      don't remove the temporary directory
+  <output>          if not separate, and file, aggregates into <output>
+                    if not separate, and (perhaps non-existant) directory,
+                        aggregates into <output>/\`basename <output>\`.<fmt>
+                    if separate, and file, it's an error
+                    if separate, and existing directory, places all in <output>/
+                    if separate, and non-existant directory, it's an error
+EOF
+}
+die() { local e="$1" ; shift ; printf "%s$@\n" "error: " >&2 ; exit "${e:-0}" ; }
+udie() { usage >&2 ; die "$E_USAGE" "$@" ; }
+error() { printf "%s$@\n" "error: " >&2 ; }
+abspath() {
+    local abs=
+    case "$1" in
+    /*) ;;
+    *) abs="$(pwd)"
+       abs="${abs%/}/$1"
+       local prev=
+       while test "$abs" != "$prev" ; do
+           prev="$abs" ; abs="${abs%/.}"
+       done
+       echo "${abs:-/}"
+       return 0 ;;
+    esac
+    echo "$1"
+}
+
+done=0
+while test $# -gt 0; do
+    case "$1" in
+        --format) FORMAT="$2" ; shift ;;
+        --format=*) FORMAT="${1#*=}" ;;
+        --prefix) PREFIX="$2" ; shift ;;
+        --prefix=*) PREFIX="${1#*=}" ;;
+        --separate|-s) SEPARATE=1 ;;
+        --head) GETSHA1='(git rev-parse HEAD)' ;;
+        -f|--force) set +C ;;
+        --temp-dir|--tmp-dir) WORKDIR="$2" ; shift ;;
+        --temp-dir=*|--tmp-dir=*) WORKDIR="${1#*=}" ;;
+        -v|--verbose) VERBOSITY=$(( $VERBOSITY + 1 )) ;;
+        --verbose=*) VERBOSITY="${1#*=}" ;;
+        -q|--quiet) VERBOSITY=0 ;;
+        -n|--dry-run|--dryrun) VERBOSITY=999 ; go=ignore ; VPREFIX= ;;
+        -d|--debug) DEBUG=1 ;;
+        --no-cleanup) NO_CLEANUP=1 ;;
+        --version) version ; exit ;;
+        -h|-\?|--usage|--help) usage ; exit ;;
+        --) shift ; done=1 ; break ;;
+        -*) udie "Unrecognized option: $1" ;;
+        *) done=1 ; break ;;
+    esac
+    if test $done -eq 1 ; then break ; fi
+    shift
+done
+unset done
+OUTPUT="$(pwd)"
+if test $# -ge 1 ; then OUTPUT="$(abspath "$1")" ; shift ; fi
+if test $# -gt 0 ; then udie "Too many arguments: $@" ; fi
+case "$FORMAT" in tar|zip) ;; *) udie "Unrecognized <fmt>: $FORMAT" ;; esac
+if test $SEPARATE -eq 1 && ! test -e "$OUTPUT" ; then mkdir "$OUTPUT" ; fi
+if test $SEPARATE -eq 1 && test -e "$OUTPUT" && ! test -d "$OUTPUT" ; then
+    udie "Cannot create multiple archives when <output> is not a directory: $OUTPUT"
+elif test "$(git rev-parse --is-inside-work-tree 2>/dev/null || true)" != true ; then
+    # git submodule requirement
+    die $E_BAD_REPO "must run inside a git working tree (i.e., not a bare repository)."
+fi
+
+# Do the real work.
+if test $DEBUG -eq 1 ; then set -x ; fi
+if test -z "$WORKDIR" ; then
+    WORKDIR="$(mktemp -d "$TMPDIR/$prog.XXXXXX")"
+    verbose 1 mkdir "$WORKDIR"
+fi
+if ! test -e "$WORKDIR" ; then
+    verbose 1 mkdir "$WORKDIR"
+    mkdir "$WORKDIR"
+fi
+records="$WORKDIR/records"
+truncrecord() {
+    if test $SEPARATE -eq 0 ; then
+        echo "$1" >| "$records"
+        shift
+        local i
+        for i in "$@" ; do
+            echo "$i" >> "$records"
+        done
+    fi
+}
+appendrecord() {
+    if test $SEPARATE -eq 0 ; then
+        local i
+        for i in "$@" ; do
+            echo "$i" >> "$records"
+        done
+    fi
+}
+if test $SEPARATE -eq 0 ; then
+    superdir="$WORKDIR"
+    subdir="$WORKDIR/submodules"
+    $go mkdir "$subdir"
+else
+    superdir="$OUTPUT"
+    subdir="$OUTPUT"
+fi
+superfile="$superdir/$(basename "$(pwd)").$FORMAT"
+verbose 1 git archive --format="$FORMAT" --prefix="$PREFIX" HEAD ">|" "$superfile"
+$go credir "$superfile" git archive --format="$FORMAT" --prefix="$PREFIX" HEAD
+truncrecord "$superfile"
+git submodule foreach -q 'echo ${path%/} $'"$GETSHA1" | while read path sha1 ; do
+    (cd "$path"
+    #if test $SEPARATE -eq 1 || test "$FORMAT" != tar ; then
+        subfile="$subdir/$(echo "$path" | sed 's#/#.#g').$FORMAT"
+        verbose 1 git archive --format="$FORMAT" --prefix="${PREFIX}${path}/" "$sha1" ">" "$subfile"
+        if ! $go redir "$subfile" git archive --format="$FORMAT" --prefix="${PREFIX}${path}/" "$sha1" ; then
+            exit $E_BAD_WRITE
+        fi
+        if test "$FORMAT" = zip && test -f "$records"; then
+            # delete the empty directory entry; zipped submodules won't unzip if we don't do this
+            verbose 2 zip -d "$(tail -n 1 "$records")" "${PREFIX}${path}"
+            $go zip -d "$(tail -n 1 "$records")" "${PREFIX}${path}" >/dev/null # remove trailing '/'
+        fi
+        appendrecord "$subfile"
+    #else
+    #    verbose 1 git archive --format="$FORMAT" --prefix="${PREFIX}${path}/" "$sha1" "|" tar -A -f "$superfile"
+    #    $go git archive --format="$FORMAT" --prefix="${PREFIX}${path}/" "$sha1" | tar -A -f "$superfile"
+    #fi
+    ) || exit $?
+done
+if test -f "$records" ; then
+    if test $SEPARATE -eq 0 ; then
+        case "$FORMAT" in
+        tar)
+            sed -e '1d' "$records" | while read file; do
+                verbose 1 tar -A -f "$superfile" "$file"
+                $go tar -A -f "$superfile" "$file"
+                cleanup "$file"
+            done ;;
+        zip)
+            sed -e '1d' "$records" | while read file; do
+                # zip incorrectly stores the full path, so cd and then grow
+                (cd "$(dirname "$file")"
+                verbose 1 zip -g "$superfile" "$(basename "$file")"
+                $go zip -g "$superfile" "$(basename "$file")"
+                cleanup "$file"
+                )
+            done ;;
+        *) udie "Unrecognized <fmt>: $FORMAT" ;;
+        esac
+        truncrecord "$superfile"
+    fi
+    while read file; do
+        verbose 1 mv "$file" "$OUTPUT"
+        $go mv "$file" "$OUTPUT"
+    done < "$records"
+fi
